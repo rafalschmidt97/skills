@@ -320,7 +320,7 @@ def main():
     parser.add_argument("--runs-per-query", type=int, default=3, help="Number of runs per query")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger rate threshold")
     parser.add_argument("--model", default=None, help="Model to use (default: auto-detect based on backend)")
-    parser.add_argument("--backend", default=None, choices=["claude_cli", "anthropic_api", "github_models"],
+    parser.add_argument("--backend", default=None, choices=["claude_cli", "anthropic_api", "azure_openai", "github_models"],
                         help="LLM backend (default: auto-detect)")
     parser.add_argument("--verbose", action="store_true", help="Print progress to stderr")
     args = parser.parse_args()

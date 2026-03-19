@@ -1,15 +1,23 @@
 """LLM backend abstraction for skill-creator scripts.
 
 Provides a unified interface for making LLM calls across multiple backends:
-1. GitHub Models API (gh auth token) -- OpenAI-compatible, no extra setup
-2. claude CLI -- original Claude Code approach
-3. Anthropic API (ANTHROPIC_API_KEY) -- direct API access
+1. Azure OpenAI (AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_KEY) -- best for orgs with Azure deployments
+2. GitHub Models API (gh auth token) -- OpenAI-compatible, no extra setup
+3. claude CLI -- original Claude Code approach
+4. Anthropic API (ANTHROPIC_API_KEY) -- direct API access
 
 Backend selection order:
 - If `claude` CLI is in PATH, use it (original behavior)
 - If ANTHROPIC_API_KEY is set, use Anthropic API
+- If AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY are set, use Azure OpenAI
 - If `gh auth token` succeeds, use GitHub Models API
 - Otherwise, raise an error
+
+Azure OpenAI configuration (via environment variables):
+- AZURE_OPENAI_ENDPOINT: e.g. "https://my-resource.openai.azure.com"
+- AZURE_OPENAI_KEY: API key for the resource
+- AZURE_OPENAI_DEPLOYMENT: deployment name (default: model name passed to --model)
+- AZURE_OPENAI_API_VERSION: API version (default: "2024-12-01-preview")
 
 For trigger evaluation (tool-use detection), the API backends construct a
 system prompt with available_skills and a mock `use_skill` tool, then check
@@ -61,20 +69,38 @@ def _has_anthropic_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
+def _has_azure_openai() -> bool:
+    """Check if Azure OpenAI endpoint and key are configured."""
+    return bool(os.environ.get("AZURE_OPENAI_ENDPOINT") and os.environ.get("AZURE_OPENAI_KEY"))
+
+
+def _get_azure_openai_config() -> dict:
+    """Get Azure OpenAI configuration from environment variables."""
+    return {
+        "endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
+        "api_key": os.environ.get("AZURE_OPENAI_KEY", ""),
+        "deployment": os.environ.get("AZURE_OPENAI_DEPLOYMENT", ""),
+        "api_version": os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+    }
+
+
 def detect_backend() -> str:
     """Detect the best available backend.
 
-    Returns one of: 'claude_cli', 'anthropic_api', 'github_models'
+    Returns one of: 'claude_cli', 'anthropic_api', 'azure_openai', 'github_models'
     Raises RuntimeError if no backend is available.
     """
     if _has_claude_cli():
         return "claude_cli"
     if _has_anthropic_key():
         return "anthropic_api"
+    if _has_azure_openai():
+        return "azure_openai"
     if _get_gh_token():
         return "github_models"
     raise RuntimeError(
         "No LLM backend available. Install the claude CLI, set ANTHROPIC_API_KEY, "
+        "set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_KEY, "
         "or authenticate with `gh auth login`."
     )
 
@@ -122,6 +148,14 @@ def _resolve_model(model: str | None, backend: str) -> str:
             # Claude isn't available on GitHub Models free tier; use gpt-4o
             return "gpt-4o"
         return model
+    if backend == "azure_openai":
+        # Azure OpenAI uses deployment names, which may differ from model names.
+        # If AZURE_OPENAI_DEPLOYMENT is set, use that; otherwise use the model
+        # name as-is (assuming deployment name matches model name).
+        config = _get_azure_openai_config()
+        if config["deployment"]:
+            return config["deployment"]
+        return model or "gpt-4o"
     # For claude_cli and anthropic_api, pass through
     return model or "claude-sonnet-4-20250514"
 
@@ -144,6 +178,8 @@ def complete_text(prompt: str, model: str | None = None, backend: str | None = N
         return _complete_text_claude_cli(prompt, model, timeout)
     elif backend == "anthropic_api":
         return _complete_text_anthropic_api(prompt, model, timeout)
+    elif backend == "azure_openai":
+        return _complete_text_azure_openai(prompt, model, timeout)
     elif backend == "github_models":
         return _complete_text_github_models(prompt, model, timeout)
     else:
@@ -219,6 +255,31 @@ def _complete_text_github_models(prompt: str, model: str, timeout: int) -> str:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
+        },
+    )
+
+    with _urlopen_with_retry(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    return data["choices"][0]["message"]["content"]
+
+
+def _complete_text_azure_openai(prompt: str, model: str, timeout: int) -> str:
+    """Azure OpenAI API (OpenAI-compatible with api-key auth)."""
+    config = _get_azure_openai_config()
+    url = f"{config['endpoint']}/openai/deployments/{model}/chat/completions?api-version={config['api_version']}"
+
+    body = json.dumps({
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+
+    req = urllib.request.Request(
+        url,
+        data=body.encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "api-key": config["api_key"],
         },
     )
 
@@ -336,6 +397,8 @@ def test_trigger(
         raise NotImplementedError("Use run_eval.run_single_query() for claude_cli backend")
     elif backend == "anthropic_api":
         return _test_trigger_anthropic_api(query, skill_name, skill_description, model, timeout, other_skills)
+    elif backend == "azure_openai":
+        return _test_trigger_azure_openai(query, skill_name, skill_description, model, timeout, other_skills)
     elif backend == "github_models":
         return _test_trigger_github_models(query, skill_name, skill_description, model, timeout, other_skills)
     else:
@@ -378,6 +441,46 @@ def _test_trigger_anthropic_api(
         return False
 
     return _check_tool_use_anthropic(data, skill_name)
+
+
+def _test_trigger_azure_openai(
+    query: str, skill_name: str, skill_description: str,
+    model: str, timeout: int, other_skills: list[dict] | None,
+) -> bool:
+    """Test triggering via Azure OpenAI API with tools."""
+    config = _get_azure_openai_config()
+    url = f"{config['endpoint']}/openai/deployments/{model}/chat/completions?api-version={config['api_version']}"
+
+    skills_list = _build_skills_list(skill_name, skill_description, other_skills)
+    system = TRIGGER_SYSTEM_PROMPT.format(skills_list=skills_list)
+
+    body = json.dumps({
+        "max_tokens": 256,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": query},
+        ],
+        "tools": [USE_SKILL_TOOL_OPENAI],
+        "tool_choice": "auto",
+    })
+
+    req = urllib.request.Request(
+        url,
+        data=body.encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "api-key": config["api_key"],
+        },
+    )
+
+    try:
+        with _urlopen_with_retry(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"Warning: Azure OpenAI API call failed: {e}", file=sys.stderr)
+        return False
+
+    return _check_tool_use_openai(data, skill_name)
 
 
 def _test_trigger_github_models(
